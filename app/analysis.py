@@ -121,7 +121,10 @@ def analyze(path, name, online, update):
                 if stage_order[stage] > stage_order[current_stage]:
                     current_stage = stage
                 update(current_stage, done / total, f"{msg} · {elapsed:.1f}s")
-            _logger.info("%s completed in %.1f seconds", msg, elapsed)
+            _logger.info(
+                "analysis.stage_completed",
+                extra={"stage": stage, "elapsed_seconds": round(elapsed, 3)},
+            )
 
     def review_chunk(i, chunk):
         label = f"Reviewing part {i}/{n}: {chunk['label']}"
@@ -236,7 +239,10 @@ def analyze(path, name, online, update):
         max_new_tokens=1200,
     ) or {}
     verdict_elapsed = time.perf_counter() - verdict_started
-    _logger.info("Overall assessment completed in %.1f seconds", verdict_elapsed)
+    _logger.info(
+        "analysis.stage_completed",
+        extra={"stage": "verdict", "elapsed_seconds": round(verdict_elapsed, 3)},
+    )
     crit = sum(1 for f in findings if f["grounded"] and f["severity"] == "critical")
     major = sum(1 for f in findings if f["grounded"] and f["severity"] == "major")
     rec = str(v.get("recommendation", "")).lower().strip()

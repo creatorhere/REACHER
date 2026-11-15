@@ -25,3 +25,10 @@ data/
 *.docx
 *.sqlite3
 *.db
+
+# Test/build output
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/

@@ -91,10 +91,10 @@ def chat(system, user, max_new_tokens=None):
                 )
                 raise
             _logger.warning(
-                "Gemini request failed transiently; retry %d/5 in %.1f seconds: %s",
+                "Gemini request failed transiently; retry %d/5 in %.1f seconds (%s).",
                 attempt + 1,
                 delay,
-                msg[:200],
+                type(e).__name__,
             )
             time.sleep(delay)
 

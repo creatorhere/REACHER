@@ -9,12 +9,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Path as PathParam, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analysis, config, llm, questions
+from . import analysis, cloud, config, llm, logging_config, questions
+
+logging_config.configure()
 
 STATIC = Path(__file__).resolve().parent.parent / "static"
 ALLOWED = {".pdf", ".docx", ".txt", ".md"}
@@ -35,6 +38,20 @@ class ChatMessage(BaseModel):
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     history: list[ChatMessage] = Field(default_factory=list, max_length=8)
+
+
+class UploadMetadata(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    size: int = Field(gt=0)
+
+
+class UploadAuthorizationRequest(BaseModel):
+    files: list[UploadMetadata] = Field(min_length=1)
+    verify_online: bool = True
+
+
+class WorkerTaskRequest(BaseModel):
+    job_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]+$")
 
 
 class Job:
@@ -221,6 +238,15 @@ async def lifespan(_):
 
 
 app = FastAPI(title="Reacher", lifespan=lifespan)
+if config.CORS_ALLOWED_ORIGINS:
+    if "*" in config.CORS_ALLOWED_ORIGINS:
+        raise ValueError("CORS_ALLOWED_ORIGINS must list explicit origins; '*' is not allowed.")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ALLOWED_ORIGINS,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Idempotency-Key", cloud.TOKEN_HEADER],
+    )
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -238,11 +264,57 @@ def health():
             "max_batch_files": config.MAX_BATCH_FILES,
             "max_batch_mb": config.MAX_BATCH_MB,
         },
+        "cloud_backend": config.CLOUD_BACKEND,
     }
+
+
+@app.post("/api/uploads/authorize")
+def authorize_upload(
+    request: UploadAuthorizationRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+):
+    if config.CLOUD_BACKEND != "google":
+        raise HTTPException(404, "Direct-to-Cloud-Storage uploads are only available in Cloud Run mode.")
+    return cloud.create_uploads(request.files, request.verify_online, idempotency_key)
+
+
+@app.post("/api/jobs/{job_id}/complete")
+def complete_upload(
+    job_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND != "google":
+        raise HTTPException(404, "Cloud upload completion is only available in Cloud Run mode.")
+    return cloud.complete_upload(job_id, x_job_token)
+
+
+@app.post("/api/jobs/{job_id}/fail-upload")
+def fail_upload(
+    job_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND != "google":
+        raise HTTPException(404, "Cloud upload status is only available in Cloud Run mode.")
+    return cloud.fail_upload(job_id, x_job_token)
+
+
+@app.post("/internal/tasks/process")
+def process_cloud_task(
+    payload: WorkerTaskRequest,
+    authorization: str | None = Header(None),
+    x_cloudtasks_taskretrycount: int = Header(0, alias="X-CloudTasks-TaskRetryCount"),
+):
+    if config.CLOUD_BACKEND != "google":
+        raise HTTPException(404, "Cloud Tasks worker is not enabled.")
+    cloud.verify_task_request(authorization)
+    return cloud.process_job(payload.job_id, x_cloudtasks_taskretrycount)
 
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...), verify_online: bool = Form(True)):
+    if config.CLOUD_BACKEND == "google":
+        await file.close()
+        raise HTTPException(410, "Use /api/uploads/authorize for direct-to-Cloud-Storage uploads.")
     filename, path, _ = await _save_upload(file)
     job = Job(filename)
     JOBS[job.id] = job
@@ -253,6 +325,10 @@ async def analyze(file: UploadFile = File(...), verify_online: bool = Form(True)
 
 @app.post("/api/analyze-batch")
 async def analyze_batch(files: list[UploadFile] = File(...), verify_online: bool = Form(True)):
+    if config.CLOUD_BACKEND == "google":
+        for upload in files:
+            await upload.close()
+        raise HTTPException(410, "Use /api/uploads/authorize for direct-to-Cloud-Storage uploads.")
     if not 1 < len(files) <= config.MAX_BATCH_FILES:
         for upload in files:
             await upload.close()
@@ -324,7 +400,12 @@ async def analyze_batch(files: list[UploadFile] = File(...), verify_online: bool
 
 
 @app.get("/api/batches/{batch_id}")
-def batch_status(batch_id: str):
+def batch_status(
+    batch_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND == "google":
+        return cloud.batch_status(batch_id, x_job_token)
     batch = BATCHES.get(batch_id)
     if not batch:
         raise HTTPException(404, "Unknown paper bundle.")
@@ -355,7 +436,12 @@ def batch_status(batch_id: str):
 
 
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str):
+def job_status(
+    job_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND == "google":
+        return cloud.job_status(job_id, x_job_token)
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "Unknown job.")
@@ -363,7 +449,12 @@ def job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/result")
-def job_result(job_id: str):
+def job_result(
+    job_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND == "google":
+        return cloud.job_result(job_id, x_job_token)
     job = JOBS.get(job_id)
     if not job or job.status != "done":
         raise HTTPException(404, "Result not ready.")
@@ -374,14 +465,20 @@ def job_result(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/ask")
-def ask_about_paper(job_id: str, request: AskRequest):
+def ask_about_paper(
+    request: AskRequest,
+    job_id: str = PathParam(pattern=r"^(?:[a-f0-9]{12}|[a-f0-9]{32})$"),
+    x_job_token: str | None = Header(None, alias=cloud.TOKEN_HEADER),
+):
+    if config.CLOUD_BACKEND == "google":
+        return cloud.ask_about_paper(job_id, x_job_token, request)
     job = JOBS.get(job_id)
     if not job or job.status != "done":
         raise HTTPException(404, "Paper review not found. Upload and review the paper again.")
     question = request.question.strip()
     if not question:
         raise HTTPException(422, "Enter a question about the paper.")
-    history = [item.dict() for item in request.history[-8:]]
+    history = [item.model_dump() for item in request.history[-8:]]
     try:
         return questions.answer(_load_text(job), question, history)
     except RuntimeError as exc:

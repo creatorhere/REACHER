@@ -19,8 +19,38 @@ const STAGES = [["read", "Reading"], ["cites", "Citations"], ["digest", "Digesti
 const SEV = ["critical", "major", "minor"];
 const RECS = { "accept": "accept", "minor revision": "minor", "major revision": "major", "reject": "reject" };
 
-let files = [], R = null, activeJobId = null, activeBatchId = null, batchItems = [], qaHistory = [], activeCitation = null, sevFilter = "all", catFilter = "all", showAll = false;
+let files = [], R = null, activeJobId = null, activeBatchId = null, batchItems = [], qaHistory = [], activeCitation = null, sevFilter = "all", catFilter = "all", showAll = false, uploadWarning = "";
 let uploadLimits = null;
+const ACTIVE_KEY = "reacher.active";
+const UPLOAD_REQUEST_KEY = "reacher.upload-request";
+
+function uploadIdempotencyKey() {
+  const fingerprint = JSON.stringify({
+    files: files.map(file => ({ filename: file.name, size: file.size })),
+    verify_online: $("#online").checked
+  });
+  let saved;
+  try { saved = JSON.parse(sessionStorage.getItem(UPLOAD_REQUEST_KEY) || "null"); }
+  catch { saved = null; }
+  if (saved?.fingerprint === fingerprint && /^[a-f0-9]{32}$/.test(saved.key)) return saved.key;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const key = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  sessionStorage.setItem(UPLOAD_REQUEST_KEY, JSON.stringify({ fingerprint, key }));
+  return key;
+}
+
+function jobHeaders(id) {
+  const token = sessionStorage.getItem(`reacher.job.${id}`);
+  return token ? { "X-Job-Token": token } : {};
+}
+
+function persistActive() {
+  sessionStorage.setItem(ACTIVE_KEY, JSON.stringify({
+    jobId: activeJobId,
+    batchId: activeBatchId,
+    batchToken: activeBatchId ? sessionStorage.getItem(`reacher.batch.${activeBatchId}`) : null
+  }));
+}
 
 async function pollHealth() {
   try {
@@ -29,7 +59,7 @@ async function pollHealth() {
     m.className = "model " + s.state;
     $("span", m).textContent = s.state === "ready" ? `${s.model} · ${s.device}` : s.state === "error" ? "API key / model problem · hover" : `loading ${s.model}…`;
     if (s.limits) {
-      uploadLimits = s.limits;
+      uploadLimits = { ...s.limits, cloud_backend: s.cloud_backend };
       if (!files.length) $("#drop-sub").textContent = `${s.limits.max_file_mb} MB per paper · up to ${s.limits.max_batch_files} papers / ${s.limits.max_batch_mb} MB per bundle`;
     }
     if (s.state === "error") m.title = s.error;
@@ -66,6 +96,8 @@ drop.addEventListener("drop", ev => pick(ev.dataTransfer.files));
 $("#go").addEventListener("click", start);
 function resetUpload() {
   files = []; R = null; activeJobId = null; activeBatchId = null; batchItems = []; qaHistory = []; activeCitation = null;
+  sessionStorage.removeItem(ACTIVE_KEY);
+  sessionStorage.removeItem(UPLOAD_REQUEST_KEY);
   drop.classList.remove("has"); $("#drop-title").textContent = "Drop papers here";
   $("#drop-sub").textContent = "PDF, DOCX, TXT or MD · select one paper or a bundle";
   $("#go").disabled = true; input.value = ""; $("#err").textContent = "";
@@ -87,6 +119,7 @@ function tab(t) {
 
 async function start() {
   if (!files.length) return;
+  if (uploadLimits?.cloud_backend === "google") return startCloudUpload();
   const fd = new FormData();
   fd.append("verify_online", $("#online").checked);
   const isBatch = files.length > 1;
@@ -114,52 +147,241 @@ async function start() {
   }
 }
 
+function putUpload(url, file, contentType, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("PUT", url);
+    request.setRequestHeader("Content-Type", contentType);
+    request.upload.onprogress = event => {
+      if (event.lengthComputable) onProgress(event.loaded / event.total);
+    };
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) resolve();
+      else reject(new Error("Cloud Storage rejected the upload. Request a new upload link and try again."));
+    };
+    request.onerror = () => reject(new Error("Network interruption during upload. You can retry the upload."));
+    request.onabort = () => reject(new Error("Upload was interrupted."));
+    request.send(file);
+  });
+}
+
+function uploadRequest(url, headers, body, progressStart, total, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("PUT", url);
+    Object.entries(headers).forEach(([name, value]) => request.setRequestHeader(name, value));
+    request.upload.onprogress = event => {
+      if (event.lengthComputable) onProgress(Math.min(total, progressStart + event.loaded) / total);
+    };
+    request.onload = () => resolve({
+      status: request.status,
+      range: request.getResponseHeader("Range")
+    });
+    request.onerror = () => reject(new Error("Network interruption during upload."));
+    request.send(body);
+  });
+}
+
+function nextUploadOffset(range) {
+  const match = /^bytes=0-(\d+)$/.exec(range || "");
+  return match ? Number(match[1]) + 1 : 0;
+}
+
+async function resumableUpload(url, file, contentType, onProgress) {
+  const chunkSize = 8 * 1024 * 1024;
+  let offset = 0, retries = 0;
+  while (offset < file.size) {
+    const end = Math.min(offset + chunkSize, file.size);
+    try {
+      const response = await uploadRequest(url, {
+        "Content-Type": contentType,
+        "Content-Range": `bytes ${offset}-${end - 1}/${file.size}`
+      }, file.slice(offset, end), offset, file.size, onProgress);
+      if (response.status === 200 || response.status === 201) return;
+      if (response.status !== 308) throw new Error("Cloud Storage rejected the upload.");
+      const next = nextUploadOffset(response.range);
+      if (next <= offset) throw new Error("Upload progress could not be confirmed.");
+      offset = next;
+      retries = 0;
+    } catch (error) {
+      if (++retries > 5) throw new Error("Upload could not resume after repeated network failures.");
+      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * (2 ** (retries - 1)), 8000)));
+      const status = await uploadRequest(url, {
+        "Content-Range": `bytes */${file.size}`
+      }, null, offset, file.size, onProgress);
+      if (status.status === 200 || status.status === 201) return;
+      if (status.status !== 308) throw error;
+      const next = nextUploadOffset(status.range);
+      if (next < offset) throw new Error("Cloud Storage reported an invalid upload offset.");
+      offset = next;
+    }
+  }
+}
+
+async function startCloudUpload() {
+  const isBatch = files.length > 1;
+  const stages = isBatch ? [...STAGES, ["papers", "Papers"]] : STAGES;
+  let authorization = null;
+  uploadWarning = "";
+  const completedUploads = new Set();
+  $("#rail").replaceChildren(...stages.map(([key, label]) => h("li", { dataset: { k: key } }, label)));
+  $("#log").textContent = "Preparing secure direct upload…";
+  setProgress(0, "read");
+  $("#go").disabled = true;
+  show("v-run");
+  try {
+    const idempotencyKey = uploadIdempotencyKey();
+    const response = await fetch("/api/uploads/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({
+        verify_online: $("#online").checked,
+        files: files.map(file => ({ filename: file.name, size: file.size }))
+      })
+    });
+    authorization = await response.json();
+    if (!response.ok) throw new Error(authorization.detail || "Could not authorize the uploads.");
+    activeBatchId = authorization.batch_id;
+    if (activeBatchId) sessionStorage.setItem(`reacher.batch.${activeBatchId}`, authorization.batch_token);
+    authorization.uploads.forEach(upload => sessionStorage.setItem(`reacher.job.${upload.job_id}`, upload.token));
+
+    for (let index = 0; index < authorization.uploads.length; index++) {
+      const upload = authorization.uploads[index], file = files[index];
+      if (upload.status !== "uploading") {
+        completedUploads.add(upload.job_id);
+        continue;
+      }
+      activeJobId = upload.job_id;
+      persistActive();
+      $("#log").textContent = `Uploading ${upload.filename}… 0%`;
+      const progress = fraction => {
+        $("#log").textContent = `Uploading ${upload.filename}… ${Math.round(fraction * 100)}%`;
+      };
+      if (upload.upload_mode === "resumable") {
+        await resumableUpload(upload.upload_url, file, upload.content_type, progress);
+      } else {
+        await putUpload(upload.upload_url, file, upload.content_type, progress);
+      }
+      const complete = await fetch(`/api/jobs/${upload.job_id}/complete`, {
+        method: "POST",
+        headers: jobHeaders(upload.job_id)
+      });
+      const completion = await complete.json();
+      if (!complete.ok) throw new Error(completion.detail || `Could not queue ${upload.filename}.`);
+      completedUploads.add(upload.job_id);
+    }
+
+    if (activeBatchId) {
+      activeJobId = null;
+      persistActive();
+      pollBatch(activeBatchId);
+    } else {
+      activeJobId = authorization.uploads[0].job_id;
+      persistActive();
+      poll(activeJobId);
+    }
+  } catch (error) {
+    if (authorization?.uploads) {
+      const cleanupErrors = (await Promise.all(authorization.uploads
+        .filter(upload => !completedUploads.has(upload.job_id))
+        .map(async upload => {
+          try {
+            const response = await fetch(`/api/jobs/${upload.job_id}/fail-upload`, {
+              method: "POST",
+              headers: jobHeaders(upload.job_id)
+            });
+            return response.ok ? null : upload.filename;
+          } catch {
+            return upload.filename;
+          }
+        }))).filter(Boolean);
+      if (cleanupErrors.length) {
+        uploadWarning = ` Could not update upload status for: ${cleanupErrors.join(", ")}.`;
+      }
+      if (activeBatchId) {
+        activeJobId = null;
+        persistActive();
+        $("#log").textContent = `An upload failed: ${error.message || "network error"}.${uploadWarning} Showing available paper results…`;
+        show("v-run");
+        pollBatch(activeBatchId);
+        return;
+      }
+    }
+    show("v-upload");
+    $("#err").textContent = (error.message || "Upload failed.") + uploadWarning;
+    $("#go").disabled = false;
+  }
+}
+
 function setProgress(p, stage) {
   $("#pct").textContent = Math.round(p * 100);
   $("#bar").style.width = p * 100 + "%";
-  const idx = STAGES.findIndex(s => s[0] === stage);
-  document.querySelectorAll("#rail li").forEach((li, i) => {
+  const steps = [...document.querySelectorAll("#rail li")];
+  let idx = stage === "done" ? steps.length : steps.findIndex(li => li.dataset.k === stage);
+  if (idx < 0) idx = 0;
+  steps.forEach((li, i) => {
     li.className = i < idx ? "done" : i === idx ? "now" : "";
   });
 }
 
 async function poll(id) {
-  const response = await fetch(`/api/jobs/${id}`);
-  const s = await response.json();
-  if (!response.ok) { show("v-upload"); $("#err").textContent = s.detail || "Could not check the review status."; $("#go").disabled = false; return; }
-  setProgress(s.progress, s.stage);
-  $("#log").textContent = s.log.map(l => "› " + l).join("\n");
-  if (s.status === "running" || s.status === "queued") return setTimeout(() => poll(id), 1000);
-  if (s.status === "error") { show("v-upload"); $("#err").textContent = s.error; $("#go").disabled = false; return; }
-  const result = await fetch(`/api/jobs/${id}/result`);
-  if (!result.ok) { show("v-upload"); $("#err").textContent = (await result.json()).detail || "Could not load the review."; $("#go").disabled = false; return; }
-  R = await result.json();
-  render();
+  try {
+    const response = await fetch(`/api/jobs/${id}`, { headers: jobHeaders(id) });
+    const s = await response.json();
+    if (!response.ok) throw new Error(s.detail || "Could not check the review status.");
+    setProgress(s.progress, s.stage);
+    $("#log").textContent = s.log.map(l => "› " + l).join("\n");
+    if (["uploading", "queued", "processing", "running"].includes(s.status)) return setTimeout(() => poll(id), 2000);
+    if (["failed", "error"].includes(s.status)) throw new Error(s.error || "The review failed.");
+    if (!["completed", "done"].includes(s.status)) throw new Error("The review returned an unexpected status.");
+    const result = await fetch(`/api/jobs/${id}/result`, { headers: jobHeaders(id) });
+    const data = await result.json();
+    if (!result.ok) throw new Error(data.detail || "Could not load the review.");
+    activeJobId = id;
+    R = data;
+    persistActive();
+    render();
+  } catch (error) {
+    if (error instanceof TypeError) {
+      $("#log").textContent = "Connection interrupted. Reconnecting…";
+      return setTimeout(() => poll(id), 4000);
+    }
+    show("v-upload");
+    $("#err").textContent = error.message || "Could not check the review status.";
+    $("#go").disabled = false;
+  }
 }
 
 async function pollBatch(id) {
   try {
-    const response = await fetch(`/api/batches/${id}`);
+    const response = await fetch(`/api/batches/${id}`, {
+      headers: { "X-Job-Token": sessionStorage.getItem(`reacher.batch.${id}`) || "" }
+    });
     const status = await response.json();
     if (!response.ok) throw new Error(status.detail || "Could not check the bundle status.");
-    setProgress(status.progress, status.status === "running" ? status.stage : "papers");
+    setProgress(status.progress, status.status === "completed" ? "done" : status.stage);
     $("#log").textContent = [
       `Completed ${status.completed} of ${status.total} papers.`,
+      uploadWarning,
       ...status.log.map(line => "› " + line)
     ].join("\n");
-    if (status.status === "running") return setTimeout(() => pollBatch(id), 1000);
+    if (["uploading", "queued", "processing", "running"].includes(status.status)) return setTimeout(() => pollBatch(id), 2000);
     batchItems = status.items;
     renderBatchOverview();
-    const firstSuccess = batchItems.find(item => item.status === "done");
+    const firstSuccess = batchItems.find(item => ["completed", "done"].includes(item.status));
     if (firstSuccess) await openBatchPaper(firstSuccess.job_id);
     else { $("#review-content").hidden = true; show("v-result"); }
   } catch (error) {
+    if (error instanceof TypeError) {
+      $("#log").textContent = "Connection interrupted. Reconnecting…";
+      return setTimeout(() => pollBatch(id), 4000);
+    }
     show("v-upload"); $("#err").textContent = error.message || "Could not check the bundle."; $("#go").disabled = false;
   }
 }
 
 function renderBatchOverview() {
-  const overview = $("#batch-overview"), successful = batchItems.filter(item => item.status === "done").length;
+  const overview = $("#batch-overview"), successful = batchItems.filter(item => ["completed", "done"].includes(item.status)).length;
   const failed = batchItems.length - successful;
   overview.hidden = false;
   overview.replaceChildren(
@@ -169,8 +391,8 @@ function renderBatchOverview() {
     h("p", { class: "err", id: "batch-error", role: "alert" }),
     h("div", { class: "batch-list" }, batchItems.map(item =>
       h("article", { class: "batch-item" },
-        h("div", {}, h("b", {}, item.name), h("small", {}, item.status === "done" ? "Review complete" : `Could not review: ${item.error}`)),
-        item.status === "done" && h("button", {
+        h("div", {}, h("b", {}, item.name), h("small", {}, ["completed", "done"].includes(item.status) ? "Review complete" : ["failed", "error"].includes(item.status) ? `Could not review: ${item.error}` : "Waiting for review")),
+        ["completed", "done"].includes(item.status) && h("button", {
           class: "btn ghost",
           type: "button",
           onclick: () => openBatchPaper(item.job_id)
@@ -178,17 +400,19 @@ function renderBatchOverview() {
       )
     ))
   );
+  $("#batch-error").textContent = uploadWarning;
 }
 
 async function openBatchPaper(id) {
   const item = batchItems.find(paper => paper.job_id === id);
-  if (!item || item.status !== "done") return;
+  if (!item || !["completed", "done"].includes(item.status)) return;
   try {
-    const response = await fetch(`/api/jobs/${id}/result`);
+    const response = await fetch(`/api/jobs/${id}/result`, { headers: jobHeaders(id) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || "Could not load this review.");
     activeJobId = id;
     R = result;
+    persistActive();
     renderBatchOverview();
     render();
   } catch (error) {
@@ -319,7 +543,7 @@ async function askPaper(event) {
   try {
     const response = await fetch(`/api/jobs/${activeJobId}/ask`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...jobHeaders(activeJobId) },
       body: JSON.stringify({ question, history: prior.slice(-8) })
     });
     const result = await response.json();
@@ -414,3 +638,18 @@ $("#x-md").addEventListener("click", () => {
     ...R.citations.issues.map(i => `- ${i.text}`)].join("\n");
   download(`${exportBaseName()}-review.md`, "text/markdown", md);
 });
+
+try {
+  const active = JSON.parse(sessionStorage.getItem(ACTIVE_KEY) || "null");
+  if (active?.batchId) {
+    activeBatchId = active.batchId;
+    show("v-run");
+    pollBatch(activeBatchId);
+  } else if (active?.jobId && sessionStorage.getItem(`reacher.job.${active.jobId}`)) {
+    activeJobId = active.jobId;
+    show("v-run");
+    poll(activeJobId);
+  }
+} catch {
+  sessionStorage.removeItem(ACTIVE_KEY);
+}
