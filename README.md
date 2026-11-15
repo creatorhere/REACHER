@@ -1,237 +1,819 @@
-# Reacher
+# REACHER
 
-Reacher is my semester project. I wanted a tool that could help me review research papers and point out issues in context, but I couldn't find one that worked the way I wanted. So I decided to build it for myself.
+### AI-Assisted Research Paper Review
 
-Upload one paper or a bundle and Reacher uses Gemma 4 to identify potential issues, anchor feedback to quoted passages, suggest fixes, summarise the paper, check its references, and answer follow-up questions using relevant paper passages. It's a study aid and first-pass reviewer, not a substitute for your own judgment.
+**REACHER** is an AI-powered research paper review platform designed to help students, researchers, and academic readers examine research papers more critically.
 
-Gemma 4 is called through the **Gemini API** (Google AI Studio), so there is nothing to download and no GPU is needed.
+Upload a single paper or an entire bundle of documents. REACHER analyzes arguments, methodology, evidence, claims, and references, then presents potential issues with supporting quotations from the original document.
 
-## Setup
+Instead of simply generating a generic summary, REACHER aims to make feedback traceable: findings are connected to the passages that prompted them, making it easier to inspect, understand, and verify the model's suggestions.
 
-1. Get a free API key at https://aistudio.google.com/apikey
-2. Copy `.env.example` to `.env` and paste the key:
-   ```
-   GEMINI_API_KEY=your_key_here
-   ```
-3. Install and run:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate        # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
-   python run.py
-   ```
+> REACHER is a research-assistance tool, not an automated academic authority. Its findings should be reviewed and validated by a human reader.
 
-The browser opens at http://127.0.0.1:8080. The status pill (top right) turns green when the key is loaded. Hover over it if it turns red.
+---
 
-For local development, the port defaults to 8080 and can be changed with `PORT`. Local mode intentionally keeps the current in-process job store; it is not suitable for multiple instances or persistent production jobs.
+## Table of Contents
 
-## Models
+- [Overview](#overview)
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [Technology Stack](#technology-stack)
+- [System Architecture](#system-architecture)
+- [Supported Documents](#supported-documents)
+- [Getting Started](#getting-started)
+- [Configuration](#configuration)
+- [Google Cloud Deployment](#google-cloud-deployment)
+- [Security and Privacy](#security-and-privacy)
+- [Limitations](#limitations)
+- [Project Structure](#project-structure)
+- [Future Improvements](#future-improvements)
+- [License](#license)
 
-Set `GEMMA_MODEL` in `.env`.
+---
 
-| Model id | Notes |
+## Overview
+
+Research papers can be difficult to evaluate thoroughly. Identifying weak arguments, methodological problems, unsupported claims, and citation inconsistencies requires more than reading a summary.
+
+REACHER approaches this problem through a multi-stage AI-assisted review pipeline.
+
+It uses **Gemma through the Gemini API** to analyze extracted document text and identify potential problems. The application then grounds findings in the original paper, checks references, and provides a question-answering interface for further investigation.
+
+### What REACHER does
+
+- Reviews research papers for potential academic and structural issues.
+- Identifies weaknesses in methodology, reasoning, statistics, and claims.
+- Anchors findings to quotations from the original paper.
+- Highlights relevant passages for easier verification.
+- Generates an overall review verdict and paper summary.
+- Examines citation consistency and reference lists.
+- Optionally checks references against Crossref.
+- Supports follow-up questions grounded in the uploaded paper.
+- Processes multiple papers as a review bundle.
+
+---
+
+## Features
+
+### 1. AI-Assisted Paper Review
+
+REACHER examines different dimensions of a research paper, including:
+
+| Review area | What it examines |
 |---|---|
-| `gemma-4-26b-a4b-it` (default) | faster, lighter on rate limits |
-| `gemma-4-31b-it` | strongest critique |
+| Methodology | Research design, experimental approach, and methodological gaps |
+| Statistics | Statistical reasoning, interpretation, and reported results |
+| Logic | Contradictions, reasoning gaps, and unsupported conclusions |
+| Claims | Overgeneralization and claims exceeding the presented evidence |
+| Data | Missing evidence, inconsistent reporting, and data-related concerns |
+| Reproducibility | Whether the described methodology supports reproducibility |
+| Citations | Citation consistency and reference-related issues |
+| Ethics | Potential ethical concerns |
+| Clarity | Ambiguous explanations and structural clarity |
 
-Other settings: `MAX_NEW_TOKENS` (4096), `CHUNK_CHARS` (8000), `GEMINI_CONCURRENCY` (3 simultaneous model calls), `MAX_UPLOAD_MB` (200 per paper), `MAX_BATCH_FILES` (10), `MAX_BATCH_MB` (512 per bundle), `CROSSREF_MAILTO` (your email, for Crossref), and `PORT` (8000). Select or drop multiple PDF, DOCX, TXT, or MD files to review a bundle. Bundle reviews run one paper at a time; each paper has its own result, and a failed file does not discard successful reviews. Only one bundle can run at a time. Individual uploads are streamed to temporary files instead of being copied into application memory. Batch review results and extracted text are stored in the system temporary directory while Reacher is running and removed when it exits; individual review results remain in memory. Long-paper chunk reviews run concurrently, and each chunk now produces its factual notes and critique in one model call. The summary and cross-section check run together while citation checks overlap with model work. Large bundles may take a long time and use substantial Gemini API quota; each paper is reviewed separately. If you hit 429 rate limits, lower `GEMINI_CONCURRENCY` in `.env` to `1` or `2`; transient errors use jittered backoff, honor retry hints when possible, and cap cumulative retry delays at 60 seconds. The Gemini SDK's automatic retries are disabled so this single retry policy controls waiting. Timings for completed pipeline stages are logged.
+Findings are categorized by severity:
 
-## How it stays accurate
+- **Critical** — potentially fundamental problems.
+- **Major** — substantial issues requiring attention.
+- **Minor** — smaller concerns or opportunities for improvement.
 
-1. **Parsing.** PDF text is read block by block with column-aware ordering. Headers, footers and the reference list are separated from the body.
-2. **Chunked review.** Long papers are split along section boundaries. Each chunk is reviewed with the abstract as context.
-3. **Verbatim anchoring.** Every finding must quote the paper. The quote is located in the document text, so each flaw is highlighted in place. Findings whose quote cannot be found are hidden by default and flagged as unverified.
-4. **Cross-section pass.** A separate pass compares abstract and conclusion claims against the rest of the paper, to catch overclaiming and contradictions.
-5. **Deduplication, severity ranking, and a calibrated verdict** built only from the confirmed findings.
-6. **Citations.** In-text markers (`[3]`, `[1–4]`, `(Smith et al., 2020)`) are matched to the reference list to find dangling and uncited entries and duplicates. Author-year citations require an exact first-author surname and year match; ambiguous same-author/year references are reported rather than silently assigned. Optional Crossref checks compare candidate title, first author, year, and any supplied DOI, ranking multiple search results instead of trusting the first hit. Only strong multi-field matches are called verified; unresolved matches and lookup failures are reported separately and are not treated as proof a source is fabricated.
-7. **Paper Q&A.** Ask follow-up questions after a review. Reacher selects relevant text passages, answers from those excerpts, and links cited evidence back to its location in the paper. If it cannot find enough support, it says so rather than guessing.
+The final review includes a calibrated recommendation, such as accept, minor revision, major revision, or reject.
 
-## Network use
+These recommendations are AI-generated assessments, not actual publication decisions.
 
-The paper text is sent to the Gemini API for analysis, so don't upload anything you are not allowed to share with Google. Paper Q&A sends your question, recent conversation context, and selected paper excerpts to Gemini. The optional Crossref lookup sends only reference strings (untick the box in the UI to disable it). In local mode, individual jobs and results are process-local and bundle results use temporary files. In Cloud Run mode, uploaded files and completed results live in a private Cloud Storage bucket and job metadata lives in Firestore.
+### 2. Passage-Anchored Findings
 
-## Limits
+Every displayed finding is expected to include a quotation from the original document.
 
-- Scanned PDFs need OCR first. No OCR is included.
-- Upload limits default to 200 MB per paper and 10 papers / 512 MB per bundle. You can raise or lower them in `.env`, but larger files use more disk, memory, and Gemini API quota; image-only scanned PDFs still need OCR.
-- The model can still miss flaws or misjudge them. Treat the output as a thorough first reviewer, not a verdict. The quote and fix are always shown so you can check each one.
-- "Unverified" on a reference means no close Crossref match. Preprints, books and many conference papers are not indexed there.
-- Equations, tables and figures are only seen as extracted text.
-- Q&A uses keyword-based passage selection, so it may miss evidence expressed with different terminology.
+REACHER attempts to locate the quotation in the extracted paper text and connect it to the relevant passage.
 
-## Production deployment: Google Cloud Run
+This makes it possible to:
 
-Cloud Run deployment uses a separate API and worker service backed by private Cloud Storage, Firestore Native Mode, and Cloud Tasks. The API and worker use the same image and code, but deploy as separate Cloud Run services; only the API is public. Production mode is selected with `CLOUD_BACKEND=google`.
+- Inspect the evidence behind a finding.
+- Understand why the model raised a concern.
+- Navigate to the relevant section.
+- Verify whether the criticism is justified.
+
+Findings whose quotations cannot be located are treated as unverified and hidden by default.
+
+### 3. Research Paper Summary
+
+REACHER generates a structured summary to help readers understand the paper's central contribution and content without relying exclusively on a generic abstract.
+
+### 4. Citation and Reference Analysis
+
+The citation analysis pipeline examines:
+
+- In-text citations.
+- Missing reference entries.
+- References that are never cited.
+- Potential duplicate references.
+- Citation and bibliography inconsistencies.
+- Author-year citation matching.
+- Reference publication years and related statistics.
+
+It supports numeric citations and author-year citation styles.
+
+#### Optional Crossref verification
+
+REACHER can compare extracted references with records from [Crossref](https://www.crossref.org/).
+
+The optional online check evaluates candidate records using multiple fields, including:
+
+- Title.
+- First author.
+- Publication year.
+- Supplied DOI, when available.
+
+Only strong multi-field matches are treated as verified. Unresolved matches, ambiguous references, and lookup failures are reported separately.
+
+A reference that cannot be verified through Crossref is not automatically fabricated.
+
+### 5. Paper-Grounded Q&A
+
+After a review, users can ask questions about the uploaded paper.
+
+Examples:
+
+- What are the main limitations of this study?
+- Does the conclusion follow from the experimental results?
+- Which section discusses the research methodology?
+- What evidence supports the authors' main claim?
+
+REACHER selects relevant passages from the paper and sends them to Gemini as context.
+
+Answers include evidence references that link back to the relevant passages. If sufficient supporting evidence cannot be found, REACHER is designed to abstain rather than invent an answer.
+
+### 6. Batch Paper Review
+
+Users can select multiple papers and submit them as a single review bundle.
+
+Features include:
+
+- Multiple-document upload.
+- Individual review results for each paper.
+- Per-paper progress and error reporting.
+- Batch-level progress tracking.
+- Preservation of successful results when another document fails.
+
+Each paper is reviewed separately. A failed document does not automatically invalidate the other reviews.
+
+### 7. Exportable Results
+
+Completed reviews can be exported in:
+
+- Markdown (`.md`)
+- JSON (`.json`)
+
+This makes it easier to preserve findings, share review notes, or use results in other workflows.
+
+---
+
+## How It Works
+
+REACHER follows a multi-stage document analysis pipeline.
+
+### Review pipeline
+
+1. **Document upload** — the user selects a PDF, DOCX, TXT, or Markdown document.
+2. **Document parsing** — the application extracts text and identifies document structure.
+3. **Section-aware processing** — long documents are divided into manageable sections.
+4. **AI analysis** — Gemma examines the paper and generates structured findings.
+5. **Quote grounding** — quotations are matched against the extracted document text.
+6. **Cross-section analysis** — claims in the abstract and conclusion are compared with the rest of the paper.
+7. **Citation analysis** — in-text citations are matched against the reference list.
+8. **Optional online verification** — Crossref is used to investigate reference matches.
+9. **Result generation** — findings are deduplicated, ranked, and assembled into a review.
+10. **Interactive Q&A** — users can ask additional questions using relevant paper passages.
+
+### Document processing
+
+PDF extraction uses PyMuPDF, including block-level reading and column-aware ordering. The parser also separates headers, footers, and reference sections where possible.
+
+Long papers are divided along section boundaries. Each chunk is reviewed with the abstract as context.
+
+This reduces the need to submit an entire long document in one model request.
+
+### Accuracy and grounding
+
+REACHER uses several safeguards to make its results easier to verify:
+
+- Findings are checked against document quotations.
+- Unlocatable quotations are not treated as verified evidence.
+- Cross-section analysis looks for contradictions and overclaiming.
+- Reference matching avoids silently assigning ambiguous author-year citations.
+- Paper Q&A uses selected document passages rather than relying solely on general model knowledge.
+
+These safeguards improve traceability, but they do not guarantee that every finding is correct.
+
+---
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Backend framework | Python, FastAPI |
+| Frontend | HTML, CSS, JavaScript |
+| AI model | Gemma |
+| AI integration | Google Gemini API (`google-genai`) |
+| PDF processing | PyMuPDF |
+| DOCX processing | python-docx |
+| Reference verification | Crossref API |
+| API server | Uvicorn |
+| Containerization | Docker |
+| Cloud application hosting | Google Cloud Run |
+| Object storage | Google Cloud Storage |
+| Job metadata and status | Firestore Native Mode |
+| Background task scheduling | Google Cloud Tasks |
+| Secret management | Google Cloud Secret Manager |
+| Container image storage | Artifact Registry |
+| Container builds | Google Cloud Build |
+
+---
+
+## System Architecture
+
+REACHER is designed as a website with an integrated backend and a separate background-processing worker.
+
+The public-facing Cloud Run service serves the website and handles its internal application operations. The worker is a separate private Cloud Run service responsible for long-running paper reviews.
+
+The application is not intended to be presented as a standalone public API product.
+
+### Architecture diagram
 
 ```mermaid
-flowchart LR
-    Browser -->|metadata request| API[Cloud Run API]
-    Browser -->|signed PUT| GCS[(Private Cloud Storage)]
-    API -->|job and batch metadata| FS[(Firestore)]
-    API -->|authenticated OIDC task| Tasks[Cloud Tasks]
-    Tasks -->|OIDC| Worker[Private Cloud Run worker]
-    Worker -->|download paper / save result and manifest| GCS
-    Worker -->|job progress and status| FS
-    Worker --> Gemini[Gemini API]
-    API -->|paper Q&A| Gemini
+flowchart TD
+    U[User / Browser]
+
+    subgraph PUBLIC["Public Website"]
+        WEB["REACHER Website<br/>Cloud Run"]
+        APP["FastAPI Application<br/>Website + Internal Backend"]
+    end
+
+    subgraph GOOGLE["Google Cloud Infrastructure"]
+        GCS[("Private Cloud Storage")]
+        FS[("Firestore Native")]
+        TASKS["Cloud Tasks Queue"]
+        WORKER["Private Cloud Run Worker"]
+        SECRET["Secret Manager"]
+    end
+
+    GEMINI["Gemma via Gemini API"]
+    CROSSREF["Crossref API"]
+
+    U --> WEB
+    WEB --> APP
+
+    APP -->|"Upload authorization"| GCS
+    U -->|"Direct signed upload"| GCS
+
+    APP -->|"Job metadata"| FS
+    APP -->|"Create background task"| TASKS
+
+    TASKS -->|"Authenticated OIDC request"| WORKER
+
+    WORKER -->|"Download paper"| GCS
+    WORKER -->|"Update progress and results"| FS
+    WORKER -->|"Store review results"| GCS
+
+    WORKER -->|"AI analysis"| GEMINI
+    APP -->|"Paper-grounded Q&A"| GEMINI
+
+    APP -->|"Optional reference verification"| CROSSREF
+
+    APP -.-> SECRET
+    WORKER -.-> SECRET
 ```
 
-### Cloud services and cost notes
+### Component responsibilities
 
-Required services are Cloud Run, Cloud Storage, Firestore Native Mode, Cloud Tasks, Secret Manager, Artifact Registry or Cloud Build, and IAM Credentials for signing uploads. The app defaults to `asia-south1`; confirm that all selected services and your chosen Gemini model are available in your project/region.
-
-There is no minimum-instance setting. Cloud Run, Cloud Tasks, Firestore reads/writes, Cloud Storage capacity and operations, network egress, Artifact Registry, Secret Manager, and Gemini API usage can incur charges. Free quotas and regional prices change; check the current Google Cloud pricing pages and billing dashboard before enabling public access. Gemini usage is not necessarily covered by Google Cloud free tiers. A public API without user accounts can still be abused to create uploads and model charges; use Cloud Armor/API Gateway or another rate/abuse control if exposing this app beyond a small trusted audience.
-
-Important settings are documented in `.env.example`. `GEMINI_API_KEY` is injected from Secret Manager in production; never put it in a Docker build argument or image.
-
-| Variable | Purpose |
+| Component | Responsibility |
 |---|---|
-| `GEMINI_API_KEY`, `GEMMA_MODEL`, `MAX_NEW_TOKENS`, `CHUNK_CHARS` | Gemini credentials and analysis configuration |
-| `MAX_UPLOAD_MB`, `MAX_BATCH_FILES`, `MAX_BATCH_MB`, `RESUMABLE_UPLOAD_THRESHOLD_MB` | Server-enforced upload limits and resumable upload threshold |
-| `GEMINI_CONCURRENCY`, `CROSSREF_MAILTO`, `PORT` | Model concurrency, optional Crossref contact, and listener port |
-| `CLOUD_BACKEND` | `local` for developer mode; `google` enables durable cloud processing |
-| `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_STORAGE_BUCKET`, `GOOGLE_CLOUD_LOCATION` | Cloud project, private bucket, and regional deployment |
-| `FIRESTORE_DATABASE` | Firestore Native Mode database name (normally `(default)`) |
-| `CLOUD_TASKS_QUEUE`, `CLOUD_TASKS_LOCATION`, `CLOUD_TASKS_MAX_ATTEMPTS`, `CLOUD_TASKS_DISPATCH_DEADLINE_SECONDS` | Queue and retry/dispatch policy; queue settings must match |
-| `WORKER_SERVICE_URL`, `TASK_SERVICE_ACCOUNT` | Private worker URL and Cloud Tasks OIDC identity |
-| `SIGNED_URL_SERVICE_ACCOUNT` | Service account identity used to sign short-lived V4 upload URLs |
-| `CORS_ALLOWED_ORIGINS` | Optional comma-separated exact origins for a separately hosted frontend |
+| REACHER Website | User interface and document interaction |
+| FastAPI application | Upload authorization, job management, result retrieval, and Q&A |
+| Cloud Storage | Original uploads, review results, and batch manifests |
+| Firestore | Job metadata, processing status, and idempotency records |
+| Cloud Tasks | Reliable background task dispatch and retries |
+| Cloud Run worker | Document analysis and result generation |
+| Gemini API | AI-powered analysis and question answering |
+| Secret Manager | Secure storage of the Gemini API key |
 
-### Google Cloud setup
+### Upload workflow
 
-The commands below use Bash syntax. Replace the project ID, bucket name, and application origin. Enable billing in the project even if you expect usage to stay within free allowances.
+REACHER uses direct-to-Cloud-Storage uploads in Google Cloud mode.
 
-1. Select the project and enable the required APIs:
+1. The browser requests upload authorization.
+2. The backend validates file metadata and creates job records.
+3. The backend generates a short-lived signed upload URL or resumable upload session.
+4. The browser uploads the document directly to the private Cloud Storage bucket.
+5. The browser confirms upload completion.
+6. The backend verifies the uploaded object and queues the review.
+7. Cloud Tasks dispatches an authenticated request to the private worker.
+8. The worker processes the document and updates job progress.
+9. Results are saved to Cloud Storage, while job metadata is maintained in Firestore.
+10. The website retrieves progress and results through its backend.
 
-   ```bash
-   export PROJECT_ID="your-project-id"
-   export REGION="asia-south1"
-   export BUCKET="${PROJECT_ID}-reacher-private"
-   export API_SA="reacher-api@${PROJECT_ID}.iam.gserviceaccount.com"
-   export WORKER_SA="reacher-worker@${PROJECT_ID}.iam.gserviceaccount.com"
-   export TASK_SA="reacher-cloud-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
-   gcloud config set project "$PROJECT_ID"
-   gcloud services enable run.googleapis.com storage.googleapis.com firestore.googleapis.com \
-     cloudtasks.googleapis.com secretmanager.googleapis.com artifactregistry.googleapis.com \
-     cloudbuild.googleapis.com iamcredentials.googleapis.com
-   ```
+This design avoids routing large document uploads through the application container.
 
-2. Create runtime and task identities, then grant least-privilege roles. Keep API and worker identities separate. The API needs Firestore access, upload/result object access, task enqueue permission, and Secret Manager access for Q&A. The worker needs Firestore access, object access, and the Gemini secret. Grant bucket roles on the bucket rather than project-wide where possible.
+---
 
-   ```bash
-   gcloud iam service-accounts create reacher-api
-   gcloud iam service-accounts create reacher-worker
-   gcloud iam service-accounts create reacher-cloud-tasks
-   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-     --member="serviceAccount:${API_SA}" --role="roles/datastore.user"
-   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-     --member="serviceAccount:${API_SA}" --role="roles/cloudtasks.enqueuer"
-   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-     --member="serviceAccount:${WORKER_SA}" --role="roles/datastore.user"
-   ```
+## Supported Documents
 
-3. Create a private bucket with uniform bucket-level access and public access prevention, create a Firestore Native database, and create the Cloud Tasks queue. Use the same region for the bucket, Firestore, queue, and services where supported.
+| Format | Extension | Support |
+|---|---|---|
+| PDF | `.pdf` | Supported |
+| Microsoft Word | `.docx` | Supported |
+| Plain text | `.txt` | Supported |
+| Markdown | `.md` | Supported |
 
-   ```bash
-   gcloud storage buckets create "gs://${BUCKET}" --location="$REGION" \
-     --uniform-bucket-level-access --public-access-prevention
-   gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-     --member="serviceAccount:${API_SA}" --role="roles/storage.objectAdmin"
-   gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-     --member="serviceAccount:${WORKER_SA}" --role="roles/storage.objectAdmin"
-   gcloud firestore databases create --database="(default)" \
-     --location="$REGION" --type=firestore-native
-   gcloud tasks queues create reacher-reviews --location="$REGION" \
-     --max-attempts=20 --min-backoff=5s --max-backoff=300s \
-     --max-doublings=5 --max-concurrent-dispatches=10
-   ```
+### Default upload limits
 
-   Files up to `RESUMABLE_UPLOAD_THRESHOLD_MB` (default 32 MB) use a 15-minute signed PUT URL. Larger files use a Cloud Storage resumable session with 8 MiB chunks and a create-only generation precondition; Google expires an unfinished session after one week. Configure bucket CORS for the exact frontend origin; do not use `*`. Example `storage-cors.json`:
+| Setting | Default |
+|---|---:|
+| Maximum individual paper | 200 MB |
+| Maximum files per bundle | 10 |
+| Maximum bundle size | 512 MB |
+| Resumable upload threshold | 32 MB |
 
-   ```json
-   [{"origin":["https://YOUR-API-SERVICE-URL"],"method":["PUT"],"responseHeader":["Content-Type","Content-Range","Range"],"maxAgeSeconds":1800}]
-   ```
+Scanned, image-only PDFs require OCR before their contents can be meaningfully analyzed. OCR is not currently included.
 
-   ```bash
-   gcloud storage buckets update "gs://${BUCKET}" --cors-file=storage-cors.json
-   ```
+---
 
-4. Put the Gemini key in Secret Manager, not in an image, `.env` file, or source control. Grant `roles/secretmanager.secretAccessor` on this secret to both runtime identities. Signed URL generation with Cloud Run ADC also requires IAM Credentials API access and `roles/iam.serviceAccountTokenCreator` on the API service account for itself.
+## Getting Started
 
-   ```bash
-   gcloud secrets create GEMINI_API_KEY --replication-policy=automatic
-   printf '%s' 'YOUR_GEMINI_API_KEY' | gcloud secrets versions add GEMINI_API_KEY --data-file=-
-   gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
-     --member="serviceAccount:${API_SA}" --role="roles/secretmanager.secretAccessor"
-   gcloud secrets add-iam-policy-binding GEMINI_API_KEY \
-     --member="serviceAccount:${WORKER_SA}" --role="roles/secretmanager.secretAccessor"
-   gcloud iam service-accounts add-iam-policy-binding "$API_SA" \
-     --member="serviceAccount:${API_SA}" --role="roles/iam.serviceAccountTokenCreator"
-   ```
+REACHER can run locally without deploying the Google Cloud infrastructure.
 
-   The API identity must be allowed to act as the task OIDC identity (`roles/iam.serviceAccountUser` on `TASK_SA`). The task identity needs `roles/run.invoker` on the worker service. The Cloud Tasks service agent must retain its Google-managed `roles/cloudtasks.serviceAgent` role.
+### Prerequisites
 
-   ```bash
-   gcloud iam service-accounts add-iam-policy-binding "$TASK_SA" \
-     --member="serviceAccount:${API_SA}" --role="roles/iam.serviceAccountUser"
-   ```
+- Python 3.10 or newer (the Docker image uses Python 3.12).
+- A Gemini API key.
+- Git.
+- A modern web browser.
 
-5. Build and deploy the worker first. Deploy the worker privately and use a temporary non-empty `WORKER_SERVICE_URL` for the first deployment; fetch the actual URL and redeploy with that URL so OIDC audience verification matches it.
+Obtain a Gemini API key from:
 
-   ```bash
-   gcloud run deploy reacher-worker --source . --region="$REGION" \
-     --service-account="$WORKER_SA" --no-allow-unauthenticated \
-     --timeout=2100s --concurrency=1 \
-     --set-env-vars="CLOUD_BACKEND=google,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_STORAGE_BUCKET=${BUCKET},GOOGLE_CLOUD_LOCATION=${REGION},FIRESTORE_DATABASE=(default),CLOUD_TASKS_QUEUE=reacher-reviews,CLOUD_TASKS_LOCATION=${REGION},TASK_SERVICE_ACCOUNT=${TASK_SA},SIGNED_URL_SERVICE_ACCOUNT=${API_SA},WORKER_SERVICE_URL=https://placeholder.invalid" \
-     --set-secrets="GEMINI_API_KEY=GEMINI_API_KEY:latest"
-   export WORKER_URL="$(gcloud run services describe reacher-worker --region="$REGION" --format='value(status.url)')"
-   gcloud run services update reacher-worker --region="$REGION" \
-     --update-env-vars="WORKER_SERVICE_URL=${WORKER_URL}"
-   gcloud run services add-iam-policy-binding reacher-worker --region="$REGION" \
-     --member="serviceAccount:${TASK_SA}" --role="roles/run.invoker"
-   ```
+[Google AI Studio – API Keys](https://aistudio.google.com/apikey)
 
-6. Deploy the public API service with the actual worker URL. There is intentionally no minimum instance count. Keep the Gemini key available to the API because paper Q&A calls Gemini directly.
-
-   ```bash
-   gcloud run deploy reacher-api --source . --region="$REGION" \
-     --service-account="$API_SA" --allow-unauthenticated \
-     --set-env-vars="CLOUD_BACKEND=google,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_STORAGE_BUCKET=${BUCKET},GOOGLE_CLOUD_LOCATION=${REGION},FIRESTORE_DATABASE=(default),CLOUD_TASKS_QUEUE=reacher-reviews,CLOUD_TASKS_LOCATION=${REGION},WORKER_SERVICE_URL=${WORKER_URL},TASK_SERVICE_ACCOUNT=${TASK_SA},SIGNED_URL_SERVICE_ACCOUNT=${API_SA},MAX_UPLOAD_MB=200,MAX_BATCH_FILES=10,MAX_BATCH_MB=512" \
-     --set-secrets="GEMINI_API_KEY=GEMINI_API_KEY:latest"
-   export API_URL="$(gcloud run services describe reacher-api --region="$REGION" --format='value(status.url)')"
-   curl "${API_URL}/api/health"
-   ```
-
-   Set `GEMMA_MODEL`, `GEMINI_CONCURRENCY`, `CROSSREF_MAILTO`, and upload limits as needed. For UI/API hosted on different origins, set `CORS_ALLOWED_ORIGINS` to explicit origins and separately configure bucket CORS to allow the frontend origin. Each upload request includes a browser-generated idempotency key, so retrying the same request reuses its jobs instead of creating duplicates. The job access tokens are unguessable and required for status, result, batch, and Q&A requests; users must keep the same browser session to restore jobs after a refresh.
-
-### Local Docker and smoke tests
+### 1. Clone the repository
 
 ```bash
-docker build -t reacher:local .
-docker run --rm --env-file .env -p 8080:8080 reacher:local
-curl http://localhost:8080/api/health
+git clone https://github.com/creatorhere/REACHER.git
+cd REACHER
 ```
 
-Local Docker defaults to `CLOUD_BACKEND=local`, so this tests the app container and health route, not GCP integration. Cloud mode can be tested end-to-end only with an authorized development GCP project (or comprehensive service mocks); do not infer cloud deployment success from a local build.
+### 2. Create a virtual environment
 
-### Deployment limitations
+**Windows PowerShell**
 
-- Cloud Tasks dispatch deadlines are capped at 30 minutes. The worker service timeout is set slightly higher. A review that consistently exceeds the task deadline should move to Cloud Run Jobs or another workflow/orchestration mechanism; this implementation does not automatically migrate long-running jobs.
-- Small uploads use short-lived signed URLs; larger uploads use resumable sessions, which allow chunk retries but act as bearer URLs until Cloud Storage expires the incomplete session after one week.
-- Upload intent and job records use Firestore; results and batch manifests use Cloud Storage. Add Cloud Storage lifecycle rules and Firestore TTL policies for retention/cost control before accepting sensitive papers at scale.
-- No user accounts are introduced. Bearer ownership tokens are held in browser session storage; clearing browser session storage means losing access to those job IDs.
-- Cloud resources, IAM, Secret Manager, signed URL generation, Cloud Tasks, and authenticated worker dispatch must be set up and verified in a real project before production use.
-
-## Layout
-
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
-run.py            launcher
-app/main.py       FastAPI server and job runner
-app/analysis.py   review pipeline, quote grounding, dedupe
-app/questions.py  paper-grounded Q&A and passage selection
-app/prompts.py    all prompts
-app/parse.py      PDF/DOCX/TXT reading and section chunking
-app/citations.py  reference parsing, cross-checks, Crossref
-app/llm.py        Gemma 4 via the Gemini API (google-genai)
-static/           the UI
+
+**Linux / macOS**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 ```
+
+### 3. Install dependencies
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Configure environment variables
+
+Copy the example configuration.
+
+**Windows PowerShell**
+
+```powershell
+Copy-Item .env.example .env
+```
+
+**Linux / macOS**
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and configure your Gemini API key:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key
+
+GEMMA_MODEL=gemma-4-26b-a4b-it
+
+MAX_NEW_TOKENS=4096
+CHUNK_CHARS=8000
+GEMINI_CONCURRENCY=3
+
+MAX_UPLOAD_MB=200
+MAX_BATCH_FILES=10
+MAX_BATCH_MB=512
+
+RESUMABLE_UPLOAD_THRESHOLD_MB=32
+CROSSREF_MAILTO=
+PORT=8080
+
+CLOUD_BACKEND=local
+```
+
+Keep the remaining Google Cloud settings empty for local development.
+
+### 5. Run REACHER
+
+```bash
+python run.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8080
+```
+
+The local launcher attempts to open the browser automatically.
+
+The model status indicator in the interface reports whether the Gemini API client is ready.
+
+---
+
+## Configuration
+
+The application is configured through environment variables.
+
+### AI configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | Empty | Gemini API key |
+| `GEMMA_MODEL` | `gemma-4-26b-a4b-it` | Model identifier |
+| `MAX_NEW_TOKENS` | `4096` | Maximum generated output tokens |
+| `CHUNK_CHARS` | `8000` | Target document chunk size |
+| `GEMINI_CONCURRENCY` | `3` | Maximum simultaneous model calls |
+| `CROSSREF_MAILTO` | Empty | Optional contact email for Crossref requests |
+
+### Upload configuration
+
+| Variable | Default | Description |
+|---|---:|---|
+| `MAX_UPLOAD_MB` | `200` | Maximum individual file size |
+| `MAX_BATCH_FILES` | `10` | Maximum files in a bundle |
+| `MAX_BATCH_MB` | `512` | Maximum combined bundle size |
+| `RESUMABLE_UPLOAD_THRESHOLD_MB` | `32` | Threshold for resumable uploads |
+| `PORT` | `8080` | Application listening port |
+
+### Google Cloud configuration
+
+| Variable | Description |
+|---|---|
+| `CLOUD_BACKEND` | Selects `local` or `google` mode |
+| `GOOGLE_CLOUD_PROJECT` | Google Cloud project ID |
+| `GOOGLE_CLOUD_STORAGE_BUCKET` | Private upload and result bucket |
+| `GOOGLE_CLOUD_LOCATION` | Cloud resource region |
+| `FIRESTORE_DATABASE` | Firestore database name |
+| `CLOUD_TASKS_QUEUE` | Background processing queue |
+| `CLOUD_TASKS_LOCATION` | Cloud Tasks queue region |
+| `CLOUD_TASKS_DISPATCH_DEADLINE_SECONDS` | Maximum task dispatch deadline |
+| `CLOUD_TASKS_MAX_ATTEMPTS` | Maximum task retry attempts |
+| `WORKER_SERVICE_URL` | Private Cloud Run worker URL |
+| `TASK_SERVICE_ACCOUNT` | Service account used for task OIDC authentication |
+| `SIGNED_URL_SERVICE_ACCOUNT` | Service account used for signed upload URLs |
+| `CORS_ALLOWED_ORIGINS` | Optional comma-separated list of allowed browser origins |
+
+See `.env.example` for the complete configuration template.
+
+---
+
+## Google Cloud Deployment
+
+REACHER supports a production-oriented deployment on Google Cloud.
+
+The deployment uses:
+
+- Cloud Run for the public website and private worker.
+- Cloud Storage for document uploads and review results.
+- Firestore Native Mode for job metadata.
+- Cloud Tasks for asynchronous processing.
+- Secret Manager for the Gemini API key.
+- Artifact Registry for container images.
+- Cloud Build for source-based container builds.
+
+### Deployment layout
+
+| Service | Cloud Run service | Access |
+|---|---|---|
+| Website and application backend | `reacher` | Public |
+| Background processing worker | `reacher-worker` | Private |
+
+Both services use the same application image but have different service accounts and runtime responsibilities.
+
+The public website handles browser requests and internal backend operations. The private worker handles long-running document reviews.
+
+### Required Google Cloud APIs
+
+Enable the following APIs in your project:
+
+```bash
+gcloud services enable \
+  run.googleapis.com \
+  storage.googleapis.com \
+  firestore.googleapis.com \
+  cloudtasks.googleapis.com \
+  secretmanager.googleapis.com \
+  artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com \
+  iamcredentials.googleapis.com
+```
+
+### Example deployment configuration
+
+The following commands illustrate the deployment structure. Replace project-specific values with your own configuration and ensure the required IAM permissions and resources exist first.
+
+```bash
+export PROJECT_ID="your-project-id"
+export REGION="asia-south1"
+export BUCKET="${PROJECT_ID}-reacher-private"
+
+export API_SA="reacher-api@${PROJECT_ID}.iam.gserviceaccount.com"
+export WORKER_SA="reacher-worker@${PROJECT_ID}.iam.gserviceaccount.com"
+export TASK_SA="reacher-cloud-tasks@${PROJECT_ID}.iam.gserviceaccount.com"
+
+gcloud config set project "$PROJECT_ID"
+```
+
+### Deploy the private worker
+
+Build and deploy the worker first.
+
+```bash
+gcloud run deploy reacher-worker \
+  --source . \
+  --region="$REGION" \
+  --service-account="$WORKER_SA" \
+  --no-allow-unauthenticated \
+  --timeout=2100s \
+  --concurrency=1 \
+  --set-env-vars="CLOUD_BACKEND=google,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_STORAGE_BUCKET=${BUCKET},GOOGLE_CLOUD_LOCATION=${REGION},FIRESTORE_DATABASE=(default),CLOUD_TASKS_QUEUE=reacher-reviews,CLOUD_TASKS_LOCATION=${REGION},TASK_SERVICE_ACCOUNT=${TASK_SA},SIGNED_URL_SERVICE_ACCOUNT=${API_SA},WORKER_SERVICE_URL=https://placeholder.invalid" \
+  --set-secrets="GEMINI_API_KEY=GEMINI_API_KEY:latest"
+```
+
+Retrieve the worker URL:
+
+```bash
+export WORKER_URL="$(gcloud run services describe reacher-worker \
+  --region="$REGION" \
+  --format='value(status.url)')"
+```
+
+Update the worker with its actual URL:
+
+```bash
+gcloud run services update reacher-worker \
+  --region="$REGION" \
+  --update-env-vars="WORKER_SERVICE_URL=${WORKER_URL}"
+```
+
+Allow Cloud Tasks to invoke the worker:
+
+```bash
+gcloud run services add-iam-policy-binding reacher-worker \
+  --region="$REGION" \
+  --member="serviceAccount:${TASK_SA}" \
+  --role="roles/run.invoker"
+```
+
+### Deploy the public website
+
+Deploy the application as the public-facing REACHER website:
+
+```bash
+gcloud run deploy reacher \
+  --source . \
+  --region="$REGION" \
+  --service-account="$API_SA" \
+  --allow-unauthenticated \
+  --set-env-vars="CLOUD_BACKEND=google,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_STORAGE_BUCKET=${BUCKET},GOOGLE_CLOUD_LOCATION=${REGION},FIRESTORE_DATABASE=(default),CLOUD_TASKS_QUEUE=reacher-reviews,CLOUD_TASKS_LOCATION=${REGION},WORKER_SERVICE_URL=${WORKER_URL},TASK_SERVICE_ACCOUNT=${TASK_SA},SIGNED_URL_SERVICE_ACCOUNT=${API_SA},MAX_UPLOAD_MB=200,MAX_BATCH_FILES=10,MAX_BATCH_MB=512" \
+  --set-secrets="GEMINI_API_KEY=GEMINI_API_KEY:latest"
+```
+
+Retrieve the website URL:
+
+```bash
+export REACHER_URL="$(gcloud run services describe reacher \
+  --region="$REGION" \
+  --format='value(status.url)')"
+
+echo "$REACHER_URL"
+```
+
+Test the application:
+
+```bash
+curl "${REACHER_URL}/api/health"
+```
+
+Open the returned website URL in a browser.
+
+### Storage CORS
+
+The browser uploads documents directly to Cloud Storage, so the private bucket must allow the website's origin for the required upload methods.
+
+Create a CORS configuration using the actual website URL:
+
+```bash
+cat > storage-cors.json <<EOF
+[
+  {
+    "origin": ["${REACHER_URL}"],
+    "method": ["PUT"],
+    "responseHeader": ["Content-Type", "Content-Range", "Range"],
+    "maxAgeSeconds": 1800
+  }
+]
+EOF
+```
+
+Apply it:
+
+```bash
+gcloud storage buckets update \
+  "gs://${BUCKET}" \
+  --cors-file=storage-cors.json
+```
+
+Use the exact website origin. Do not use a wildcard origin for production uploads.
+
+### Custom website URL
+
+A Cloud Run custom URL can be configured separately from the default service URL.
+
+For example, the intended REACHER address is:
+
+```text
+https://reacher-ankit.cloud.run
+```
+
+The custom URL must be successfully claimed and mapped to the `reacher` website service before it can be treated as the production address.
+
+---
+
+## Security and Privacy
+
+REACHER processes research documents that may contain unpublished or confidential material. Users should understand how document content is handled before uploading.
+
+### Document processing
+
+In Google Cloud mode:
+
+- Uploaded files are stored in a private Cloud Storage bucket.
+- Job metadata is stored in Firestore.
+- Completed review results are stored in Cloud Storage.
+- The worker accesses storage through its assigned service account.
+- The Gemini API key is supplied through Secret Manager.
+- Cloud Tasks invokes the private worker using authenticated OIDC requests.
+
+### AI processing
+
+Paper text is sent to the Gemini API for analysis.
+
+Paper Q&A sends the user's question, recent conversation context, and selected paper passages to Gemini.
+
+Optional Crossref verification sends reference strings to Crossref. This can be disabled in the interface.
+
+Do not upload documents unless you are authorized to share their contents with the relevant external services.
+
+### Access control
+
+The application does not currently introduce user accounts or a conventional login system.
+
+Instead, cloud-mode jobs use unguessable bearer access tokens. These tokens are held in browser session storage and are required for access to the corresponding job, batch, result, and Q&A operations.
+
+Clearing the browser session can mean losing access to previously created jobs.
+
+The public website is unauthenticated at the Cloud Run service level. This does not mean the application is protected against abuse. Before opening the application to a broad audience, implement appropriate rate limiting, abuse prevention, and user access controls.
+
+### Secret management
+
+Never commit real API keys, service-account credentials, or `.env` files to GitHub.
+
+Use Secret Manager for production credentials.
+
+---
+
+## Limitations
+
+REACHER is an evolving project. The following limitations are important:
+
+- Scanned PDFs require OCR, which is not currently implemented.
+- Tables, equations, and figures are primarily analyzed through extracted text.
+- AI-generated findings may be incorrect or incomplete.
+- Citation verification depends on the coverage and quality of Crossref records.
+- Some legitimate publications may not have a strong Crossref match.
+- Paper Q&A uses keyword-based passage retrieval and may miss relevant passages expressed with different terminology.
+- Very large documents and bundles can take considerable time and consume significant model quota.
+- Local mode uses in-process job storage and is not designed for multi-instance production deployment.
+- Cloud Tasks dispatch deadlines are limited to 30 minutes in the current implementation.
+- Long-running reviews may require additional orchestration if they exceed the task deadline.
+
+REACHER should be treated as a first-pass reviewer and research companion, not as a replacement for academic judgment, peer review, or professional editorial review.
+
+---
+
+## Cost Considerations
+
+Google Cloud and Gemini API usage may incur charges.
+
+Potential cost sources include:
+
+- Cloud Run CPU and memory usage.
+- Cloud Build and Artifact Registry.
+- Cloud Storage capacity and operations.
+- Firestore reads and writes.
+- Cloud Tasks operations.
+- Secret Manager.
+- Network traffic.
+- Gemini API requests and generated tokens.
+- Optional external reference verification.
+
+Free tiers, quotas, and regional pricing can change. Check the current pricing and billing dashboard before running the application at scale.
+
+For cost control, consider:
+
+- Keeping Cloud Run minimum instances at zero where practical.
+- Limiting upload sizes and bundle sizes.
+- Monitoring Gemini API consumption.
+- Reducing `GEMINI_CONCURRENCY` if quota pressure occurs.
+- Configuring retention policies for stored uploads and results.
+- Setting billing alerts.
+
+---
+
+## Project Structure
+
+```text
+REACHER/
+│
+├── app/
+│   ├── main.py              # FastAPI application and route handling
+│   ├── cloud.py             # Google Cloud storage, tasks and job processing
+│   ├── analysis.py          # Review pipeline and finding validation
+│   ├── questions.py         # Paper-grounded Q&A and passage retrieval
+│   ├── prompts.py           # AI prompts and structured instructions
+│   ├── parse.py             # Document extraction and section parsing
+│   ├── citations.py         # Reference parsing and verification
+│   ├── llm.py               # Gemini API integration
+│   ├── config.py            # Environment and application configuration
+│   └── logging_config.py    # Application logging configuration
+│
+├── static/
+│   ├── index.html           # Website interface
+│   ├── style.css            # Application styling
+│   └── app.js               # Frontend interactions and API requests
+│
+├── .env.example             # Environment configuration template
+├── .gitignore
+├── Dockerfile               # Container configuration
+├── requirements.txt         # Python dependencies
+├── run.py                   # Local application launcher
+└── README.md
+```
+
+---
+
+## Future Improvements
+
+Potential areas for further development include:
+
+- User accounts and secure authentication.
+- Persistent user review history and document management.
+- OCR support for scanned documents.
+- More advanced semantic retrieval for paper Q&A.
+- Improved mathematical and table understanding.
+- More detailed methodology and statistical checks.
+- Additional reference databases and DOI verification.
+- Downloadable PDF review reports.
+- Review comparison across multiple versions of a paper.
+- Configurable document retention and deletion.
+- Rate limiting and abuse prevention.
+- Improved monitoring and observability for background jobs.
+
+---
+
+## License
+
+No license has been specified yet.
+
+Until a license is added to the repository, the project's reuse and redistribution terms should not be assumed to be open source.
+
+---
+
+## Project
+
+**REACHER — Research deserves a closer read.**
+
+Built as an exploration of AI-assisted academic review, document processing, and cloud-based application architecture.
